@@ -1,0 +1,17 @@
+# toolchain binaries (setup.sh khud download karta hai)
+tool/
+node_modules/
+
+# runtime output / sensitive
+out/
+keys/
+*.apk
+*.jpg.tmp
+*.jks
+*.keystore
+*-password.txt
+*.idsig
+
+# python
+__pycache__/
+*.pyc

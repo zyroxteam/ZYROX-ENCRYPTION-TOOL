@@ -1,0 +1,66 @@
+#!/tmp/prefix/bin/bash
+# ============================================================================
+#  zyrox  —  ZYROX ENCRYPTION CLI wrapper
+#  Usage:  zyrox /sdcard/myapp.apk [options]
+# ============================================================================
+set -u
+
+# repo root dhoondho (symlink ho ya direct copy)
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do
+    TARGET="$(readlink "$SELF")"
+    case "$TARGET" in
+        /*) SELF="$TARGET" ;;
+        *)  SELF="$(dirname "$SELF")/$TARGET" ;;
+    esac
+done
+HERE="$(cd "$(dirname "$SELF")/.." && pwd)"
+
+# Termux pe agar repo copy PC se aayi ho to shebangs fix kar do
+if [ -n "${PREFIX:-}" ] && [ -d "$PREFIX/bin" ]; then
+    for f in "$HERE"/*.sh "$HERE/bin/zyrox"; do
+        sed -i "1s|^#!.*|#!$PREFIX/bin/bash|" "$f" 2>/dev/null || true
+    done
+fi
+
+# python dhoondho
+PY=""
+for cand in python python3; do
+    command -v "$cand" >/dev/null 2>&1 && PY="$cand" && break
+done
+if [ -z "$PY" ]; then
+    echo "❌ python nahi mila — chalayein:  pkg install -y python" >&2
+    exit 1
+fi
+
+# toolchain check
+if [ ! -f "$HERE/tool/apktool.jar" ]; then
+    echo "⚠️  toolchain missing — setup chalaya ja raha hai…" >&2
+    bash "$HERE/setup.sh" || { echo "❌ setup fail" >&2; exit 1; }
+fi
+
+# default: output phone storage me bhi copy karo (Termux me convenient)
+ARGS=("$@")
+TO_STORAGE=0
+for a in "$@"; do
+    [ "$a" = "--to-storage" ] && TO_STORAGE=1
+    [ "$a" = "--info" ] && TO_STORAGE=0
+    case "$a" in --help|-h|--version|-v) TO_STORAGE=0 ;; esac
+done
+if [ "$#" -ge 1 ] && [ "$TO_STORAGE" = "0" ]; then
+    ARGS+=(--to-storage)
+fi
+
+# phone ko jaga rakho (lambi processing)
+if command -v termux-wake-lock >/dev/null 2>&1; then
+    termux-wake-lock 2>/dev/null || true
+    LOCKED=1
+else
+    LOCKED=0
+fi
+
+"$PY" "$HERE/zyrox.py" "${ARGS[@]}"
+RC=$?
+
+[ "${LOCKED:-0}" = "1" ] && termux-wake-unlock 2>/dev/null || true
+exit $RC

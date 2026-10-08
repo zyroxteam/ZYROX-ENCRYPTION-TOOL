@@ -1,0 +1,61 @@
+name: checks
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Python syntax check
+        run: |
+          python -m py_compile zyrox.py zyrox-verify.py assets/gen_svg.py tests/test_zyrox.py
+          echo "✅ python files compile"
+
+      - name: Bash syntax check
+        run: |
+          for f in setup.sh install.sh bin/zyrox; do
+            bash -n "$f" && echo "✅ $f"
+          done
+
+      - name: Test suite (15 tests — crypto, escaping, keys, zip)
+        run: python tests/test_zyrox.py
+
+      - name: CLI self-test (toolchain skip agar java na ho)
+        run: python zyrox.py --self-test
+
+      - name: CLI smoke — --version aur --help
+        run: |
+          python zyrox.py --version
+          python zyrox.py --help > /dev/null && echo "✅ --help ok"
+
+      - name: Regenerate SVG assets (valid XML check)
+        run: |
+          python assets/gen_svg.py
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          for f in ("assets/typing.svg", "assets/banner.svg", "assets/logo.svg"):
+              ET.parse(f)
+              print("✅", f, "valid XML")
+          PY
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck (advisory)
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning setup.sh install.sh bin/zyrox || true
+          echo "✅ shellcheck done (advisory)"
