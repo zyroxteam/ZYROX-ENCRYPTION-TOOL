@@ -26,8 +26,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import zyrox  # noqa: E402
 from zyrox import (  # noqa: E402
-    decryptor_smali, from_units, gen_keys, ks, roundtrip, sanity_check_zip,
-    to_units, units_escape, unescape, write_zip, xcrypt_units,
+    dec_payload, decryptor_smali, derive_mult, enc_payload, from_units,
+    gen_keys, guard_smali, harden_manifest, inject_guard_call, ks,
+    roundtrip, roundtrip2, sanity_check_zip, to_units, transform,
+    units_escape, unescape, write_zip, xcrypt_units,
 )
 
 import random  # noqa: E402
@@ -128,15 +130,19 @@ def test_units_escape_handles_quotes_and_backslash():
 # ------------------------------------------------------------------ key gen
 def test_gen_keys_roundtrip_and_split_correctness():
     rnd = random.Random(99)
-    for simple in (False, True):
-        k = gen_keys(rnd, simple)
-        assert 0x101 <= k["seed"] <= 0x7FFE
-        assert 0x81 <= k["mult"] <= 0x7FFF
-        assert (k["ma"] ^ k["mb"]) == k["mult"], "XOR-split mismatch (mult)"
-        assert (k["sa"] ^ k["sb"]) == k["seed"], "XOR-split mismatch (seed)"
-        assert k["desc"] == f"L{k['pkg']}/{k['cls']};"
-        assert k["meth"].startswith("a")
-        assert roundtrip("check me", k["seed"], k["mult"]) == "check me"
+    # simple mode: global seed/mult
+    k = gen_keys(rnd, True)
+    assert 0x101 <= k["seed"] <= 0x7FFE
+    assert 0x81 <= k["mult"] <= 0x7FFF
+    assert k["desc"] == f"L{k['pkg']}/{k['cls']};"
+    assert k["meth"].startswith("a")
+    assert roundtrip("check me", k["seed"], k["mult"]) == "check me"
+    # per-string mode: sirf mask hidden (XOR-split)
+    k2 = gen_keys(rnd, False)
+    assert 0x101 <= k2["mask"] <= 0xFFFE
+    assert (k2["ma"] ^ k2["mb"]) == k2["mask"], "XOR-split mismatch (mask)"
+    assert "seed" not in k2 and "mult" not in k2, "per-string mode me global keys nahi hone chahiye"
+    assert roundtrip2("check me", 0x1234, k2["mask"]) == "check me"
 
 
 def test_gen_keys_unique_names_across_builds():
@@ -153,12 +159,131 @@ def test_decryptor_smali_shape():
     assert "invoke-virtual" in smali and "int-to-char" in smali and "new-instance" in smali
     # labels balanced
     assert smali.count(":cond_0") == 2 and smali.count(":cond_1") == 2
-    # hidden mode me direct keys nahi hone chahiye
-    assert f"0x{k['seed']:04x}" not in smali, "seed smali me direct dikh raha hai!"
-    assert f"0x{k['mult']:04x}" not in smali, "mult smali me direct dikh raha hai!"
+    # per-string mode: mask smali me direct nahi dikhna chahiye (XOR-split hai)
+    assert f"0x{k['mask']:04x}" not in smali, "mask smali me direct dikh raha hai!"
+    # per-string marker: mult = seed * 0x25 + 0x1b
+    assert "0x0025" in smali and "0x001b" in smali
     # simple mode me keys direct hote hain
-    simple = decryptor_smali(k["desc"], k["meth"], {**k, "simple": True})
-    assert f"0x{k['seed']:04x}" in simple and f"0x{k['mult']:04x}" in simple
+    ks_ = gen_keys(random.Random(7), True)
+    simple = decryptor_smali(ks_["desc"], ks_["meth"], ks_)
+    assert f"0x{ks_['seed']:04x}" in simple and f"0x{ks_['mult']:04x}" in simple
+
+
+def test_per_string_crypto_roundtrip():
+    rnd = random.Random(4242)
+    for _ in range(30):
+        mask = rnd.randint(0x101, 0xFFFE)
+        seed = rnd.randint(0x1, 0xFFFE)
+        for text in EDGE_CASES:
+            if not text:
+                continue
+            got = roundtrip2(text, seed, mask)
+            assert to_units(got) == to_units(text), (seed, mask, repr(text))
+
+
+def test_per_string_unique_ciphertext():
+    """Same plaintext + alag seeds = alag ciphertext (static analysis mushkil)."""
+    units = to_units("same secret string")
+    c1 = enc_payload(units, 0x1234, 0xABCD)
+    c2 = enc_payload(units, 0x5678, 0xABCD)
+    assert c1 != c2
+    # dono wapas decrypt hote hain
+    assert dec_payload(c1, 0xABCD) == units
+    assert dec_payload(c2, 0xABCD) == units
+
+
+def test_derive_mult_deterministic():
+    assert derive_mult(0x1) == (0x25 + 0x1B) & 0xFFFF
+    assert derive_mult(0x1234) == (0x1234 * 0x25 + 0x1B) & 0xFFFF
+    for v in (0x1, 0xFFFE, 0xABCD):
+        assert 0 <= derive_mult(v) <= 0xFFFF
+
+
+def test_transform_min_len_skips_short_strings():
+    rnd = random.Random(11)
+    k = gen_keys(rnd, False)
+    stats = {"strings": 0, "units": 0, "classes": 0}
+    src = ('    const-string v0, "hi"\n'
+           '    const-string v1, "long enough string"\n')
+    out = transform(src, k, stats, False, 4, rnd)
+    # "hi" skip hui (plaintext rahi), lambi wali encrypt hui
+    assert 'const-string v0, "hi"' in out
+    assert "long enough string" not in out
+    assert stats["strings"] == 1
+    assert out.count("invoke-static") == 1
+
+
+def test_guard_smali_shape():
+    sm = guard_smali("abc", "Def", "gxyz", True, True)
+    assert sm.startswith(".class public final Labc/Def;")
+    assert ".method public static gxyz(Landroid/content/Context;)V" in sm
+    assert "isDebuggerConnected" in sm
+    assert "/system/xbin/su" in sm and "test-keys" in sm
+    assert ":try_start_0" in sm and ":catch_0" in sm
+    # sirf debug mode me root check nahi
+    sm2 = guard_smali("abc", "Def", "gxyz", True, False)
+    assert "isDebuggerConnected" in sm2 and "/system/xbin/su" not in sm2
+
+
+def _fake_dec(tmp, manifest, app_smali=None, app_dotted=None):
+    dec = Path(tmp) / "dec"
+    (dec / "smali").mkdir(parents=True)
+    (dec / "AndroidManifest.xml").write_text(manifest)
+    if app_smali and app_dotted:
+        p = dec / "smali" / (app_dotted.replace(".", "/") + ".smali")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(app_smali)
+    return dec
+
+
+def test_inject_guard_existing_app():
+    import tempfile
+    manifest = ('<manifest package="com.ex.app">\n'
+                '<application android:name="com.ex.app.MyApp" android:label="x">\n'
+                '</application></manifest>')
+    app = (".class public Lcom/ex/app/MyApp;\n"
+           ".super Landroid/app/Application;\n\n\n"
+           ".method public onCreate()V\n"
+           "    .locals 2\n\n"
+           "    invoke-super {p0}, Landroid/app/Application;->onCreate()V\n\n"
+           "    return-void\n"
+           ".end method\n")
+    with tempfile.TemporaryDirectory() as td:
+        dec = _fake_dec(td, manifest, app, "com.ex.app.MyApp")
+        info = inject_guard_call(dec, [dec / "smali"], "Lq/w;", "gx", random.Random(5))
+        assert "inject hua" in info
+        new = (dec / "smali" / "com/ex/app/MyApp.smali").read_text()
+        assert "Lq/w;->gx(Landroid/content/Context;)V" in new
+        # .locals ke BAAD inject hua (register allocation safe)
+        assert new.index(".locals 2") < new.index("Lq/w;->gx")
+
+
+def test_inject_guard_no_application():
+    import tempfile
+    manifest = ('<manifest package="com.ex.app">\n'
+                '<application android:label="x">\n'
+                '</application></manifest>')
+    with tempfile.TemporaryDirectory() as td:
+        dec = _fake_dec(td, manifest)
+        info = inject_guard_call(dec, [dec / "smali"], "Lq/w;", "gx", random.Random(5))
+        assert "naya Application banaya" in info
+        mf = (dec / "AndroidManifest.xml").read_text()
+        assert 'android:name="' in mf
+        # naya Application class bani
+        created = list((dec / "smali").rglob("Z*.smali"))
+        assert len(created) == 1
+        assert "Landroid/app/Application;" in created[0].read_text()
+
+
+def test_harden_manifest():
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        dec = Path(td)
+        (dec / "AndroidManifest.xml").write_text(
+            '<application android:debuggable="true" android:label="x">')
+        assert harden_manifest(dec) is True
+        assert 'android:debuggable="false"' in (dec / "AndroidManifest.xml").read_text()
+        assert harden_manifest(dec) is False   # dobara kuch nahi badlega
 
 
 # ------------------------------------------------------------------ zip tests

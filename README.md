@@ -11,7 +11,7 @@
 [![Platform](https://img.shields.io/badge/platform-Termux%20%7C%20Linux%20%7C%20macOS-black?style=flat-square)](https://termux.dev)
 [![Python](https://img.shields.io/badge/python-3.8%2B-3776ab?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![Java](https://img.shields.io/badge/java-11%2B-ff7a00?style=flat-square&logo=openjdk&logoColor=white)](https://adoptium.net)
-[![Version](https://img.shields.io/badge/version-1.0.0-ffb300?style=flat-square)]()
+[![Version](https://img.shields.io/badge/version-1.2.0-ffb300?style=flat-square)]()
 [![License](https://img.shields.io/badge/license-MIT-3fb950?style=flat-square)](LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-8957e5?style=flat-square)]()
 
@@ -75,7 +75,12 @@ zyrox /sdcard/Download/myapp.apk                    # Downloads se
 zyrox /sdcard/myapp.apk                             # sdcard root se
 zyrox /storage/emulated/0/Android/data/mygame.apk   # kisi bhi path se
 zyrox ~/storage/downloads/myapp.apk                 # Termux storage shortcut
+zyrox "/sdcard/Protect Apk/myapp.apk"               # SPACE wale path me QUOTES zaroori!
+zyrox /sdcard/Protect\ Apk/                        # ya poora folder do — .apk khud dhoondh lega
 ```
+
+> ⚠️ **Path me SPACE hai?** Quotes lagana mat bhoolo — bina quotes ke shell path ko tod
+> deta hai aur `unrecognized arguments: Apk/` error aata hai.
 
 > `zyrox` command na mile to: `cd zyrox-encryption && bash install.sh` dobara chalayein.
 > Output `out/` me banta hai **aur** `/sdcard/Download/zyrox/` me copy ho jata hai (file manager se install karo).
@@ -91,11 +96,20 @@ zyrox ~/storage/downloads/myapp.apk                 # Termux storage shortcut
 | `zyrox /sdcard/app.apk --no-strings` | sirf debug-strip + re-sign |
 | `zyrox /sdcard/app.apk --keep-debug` | line numbers rakho (testing ke liye) |
 | `zyrox /sdcard/app.apk --simple-keys` | keys direct (debug karna aasan) |
+| `zyrox /sdcard/app.apk --anti-debug` | debugger attach ho to app turant band |
+| `zyrox /sdcard/app.apk --anti-root` | rooted device pe app turant band (su + test-keys) |
+| `zyrox /sdcard/app.apk --harden-manifest` | `android:debuggable=true` mile to `false` |
+| `zyrox /sdcard/app.apk --min-len 8` | 8 se chhoti strings encrypt nahi (dex chhota, fast) |
 | `zyrox /sdcard/app.apk --no-sign` | unsigned output |
 | `zyrox /sdcard/app.apk --out /sdcard/myout` | apna output folder |
 | `zyrox /sdcard/app.apk --to-storage` | phone storage me copy (default ON) |
 | `zyrox --self-test` | **install check** — java/apktool/signer + crypto + zip verify (APK ki zaroorat nahi) |
 | `zyrox --version` · `zyrox --help` | version / help |
+
+**🔥 Best protection (sab kuch ON):**
+```bash
+zyrox "/sdcard/Protect Apk/myapp.apk" --anti-debug --anti-root --harden-manifest --min-len 4
+```
 
 **Proof report:**
 ```bash
@@ -110,7 +124,8 @@ python zyrox-verify.py /sdcard/myapp.apk out/myapp-protected.apk
 |---|---|
 | **1. Decode** | `apktool` se APK kholta hai (smali + resources) |
 | **2. Encrypt** | Har `const-string` encrypt → runtime pe decryptor call. Decompiler me sirf `\u3b00\u7771…` blob dikhta hai |
-| **3. Hide keys** | Random package/class/method naam, aur `seed`/`mult` keys smali me **XOR-split** (direct constants nahi) |
+| **3. Hide keys** | Random package/class/method naam. **Har string ki APNI key** (random seed) — sirf ek global mask smali me **XOR-split** (direct constants nahi). Same text do jagah ho to bhi ciphertext alag! |
+| **3b. Guards** *(optional)* | `--anti-debug` / `--anti-root`: `Application.onCreate` me guard inject — debugger ya root mile to app turant band (try/catch me, legit user kabhi crash nahi) |
 | **4. Strip debug** | `.line` `.local` `.param` `.prologue` hatata hai → decompile karke padhna mushkil |
 | **5. Repack + align** | **Sirf dex replace** karta hai (resources/assets/manifest original), `resources.arsc` 4-byte + `.so` 4096-byte aligned |
 | **6. Sign + verify** | Google ke apksigner se **v1 + v2 + v3** sign, phir verify — install har Android pe |
@@ -120,13 +135,19 @@ python zyrox-verify.py /sdcard/myapp.apk out/myapp-protected.apk
 Har build pe naya random decryptor banta hai — pure smali, koi library nahi:
 
 ```smali
-const v5, 0x46c3          # key ka aadha hissa
-xor-int/lit16 v5, v5, 0x3e1a     # key = 0x46c3 ^ 0x3e1a  (build ke hisaab se badalta hai)
+const v5, 0x46c3          # mask ka aadha hissa
+xor-int/lit16 v5, v5, 0x3e1a     # mask = 0x46c3 ^ 0x3e1a  (build ke hisaab se badalta hai)
 ...
-mul-int v4, v2, v5        # keystream = seed + i * mult
-add-int v4, v4, v6
+invoke-virtual {p0, v2}, Ljava/lang/String;->charAt(I)C
+xor-int/2addr v3, v5      # seed = charAt(0) ^ mask  (har string ki apni seed!)
+mul-int/lit16 v6, v5, 0x0025
+add-int/lit16 v6, v6, 0x001b    # mult = seed * 0x25 + 0x1b
+...
 xor-int/2addr v3, v4      # char-level decrypt
 ```
+
+v1.2 me **per-string keys**: ek hi plaintext do jagah ho to bhi dono ka ciphertext alag hota hai —
+pattern analysis se kuch nahi milega.
 
 Java ke `char` semantics ke saath **byte-for-byte identical** — `x = (seed + i * mult) & 0xFFFF` (int overflow round-trip verified), UTF-16 code units pe kaam karta hai, isliye **Hindi/Chinese/Arabic text aur emoji (surrogate pairs)** bhi 100% safe hain.
 
@@ -144,8 +165,10 @@ Java ke `char` semantics ke saath **byte-for-byte identical** — `x = (seed + i
 | Hidden keys mode | ✅ XOR-split detected & round-tripped |
 | Custom keystore (`--keys`) | ✅ cert DN match confirm |
 | Edge cases | ✅ quotes, backslash, `\n`/`\t`, **Hindi/Chinese/Arabic**, **emoji**, NUL, 400-char strings |
-| Self-test | ✅ 33 crypto cases + zip/alignment (`zyrox --self-test`) |
-| Unit tests | ✅ **15/15 pass** (`python tests/test_zyrox.py`) — CI me bhi chalte hain |
+| Self-test | ✅ 33 crypto cases + 12 per-string cases + zip/alignment (`zyrox --self-test`) |
+| Unit tests | ✅ **23/23 pass** (`python tests/test_zyrox.py`) — CI me bhi chalte hain |
+| Per-string keys | ✅ same plaintext → alag ciphertext, decrypt 100% match |
+| Guard injection | ✅ existing Application + naya Application dono cases me inject |
 
 > ⚠️ **Honest note:** asli phone pe install karke runtime test mera nahi hua (sandbox me Android device nahi tha).
 > Encryption + signing + zip structure **100% verified** hai — app ka behaviour aapko test karna hoga (checklist neeche).

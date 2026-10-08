@@ -3,6 +3,30 @@
 Sab notable changes yahan likhe jaate hain. Format: [Keep a Changelog](https://keepachangelog.com/),
 versioning: [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] — 2026-10-08
+
+### Added
+- **Per-string encryption keys** — ab har `const-string` ki APNI random seed hai; decryptor
+  `charAt(0) ^ mask` se seed nikalta hai aur `mult = seed * 0x25 + 0x1b` derive karta hai.
+  Same plaintext do jagah ho to bhi ciphertext alag — pattern analysis bekaar. Sirf ek global
+  mask smali me hidden hai (XOR-split). `--simple-keys` se purana global-key debug mode.
+- **`--anti-debug`** — `Application.onCreate` me guard inject: debugger attach ho to app turant
+  `exit(-1)`. App ka apna Application na ho to naya subclass banake manifest me lagata hai.
+- **`--anti-root`** — guard me root check: `/system/xbin/su`, `/system/bin/su`, `Build.TAGS`
+  me `test-keys`. Poora guard try/catch me — legit user kabhi crash nahi hoga.
+- **`--harden-manifest`** — `android:debuggable="true"` mile to `false` kar do.
+- **`--min-len N`** — is se chhoti strings encrypt nahi hoti (default 1; khaali strings hamesha skip).
+- **Folder input** — `zyrox "/sdcard/Protect Apk/"` do to folder me `.apk` khud dhoondh lega.
+- **Space-in-path hint** — bina quotes ke path do to ab saaf error + fix batata hai
+  (`unrecognized arguments: Apk/` → quotes lagao).
+- **`zyrox-verify.py`** per-string mode samajhta hai (mask detect + per-string decrypt-test).
+
+### Changed
+- `gen_keys()` ka structure: per-string mode me `seed`/`mult` nahi, sirf hidden `mask`.
+- Self-test me per-string crypto tests (unique ciphertext check ke saath).
+- 10 naye tests: per-string round-trip, min-len, guard smali shape, guard injection
+  (existing + naya Application), manifest harden.
+
 ## [1.1.0] — 2026-10-08
 
 ### Added

@@ -14,14 +14,20 @@
 Kya karta hai:
   1. apktool se APK decode (smali + resources)
   2. HAR string (const-string) encrypt → runtime decryptor call
-     keys bhi hiden hain: seed/mult smali me seedhe nahi (XOR-split)
+     HAR string ki APNI key: seed har string ke liye random,
+     sirf ek global mask hidden hai (XOR-split) — static analysis mushkil
   3. debug info strip (.line / .local / .param .prologue) → decompile padhna mushkil
   4. apktool se rebuild → naya dex; ORIGINAL APK me sirf dex replace (resources safe)
   5. resources.arsc 4-byte align + .so page align (zipalign jaisa)
   6. sign v1+v2+v3 + verify (proof)
+  + optional: --anti-debug / --anti-root guard (Application.onCreate me inject),
+    --harden-manifest (debuggable=false), --min-len N
 
 Usage:
   zyrox /sdcard/myapp.apk                    # aapka APK -> protected APK
+  zyrox "/sdcard/Protect Apk/myapp.apk"       # SPACE wale path me quotes lagao!
+  zyrox /sdcard/Protect\ Apk/                # ya folder do — .apk khud dhoondh lega
+  zyrox /sdcard/myapp.apk --anti-debug --anti-root --harden-manifest
   zyrox /sdcard/myapp.apk --keys my.jks      # apni keystore se sign (update ke liye)
   zyrox /sdcard/myapp.apk --info             # sirf jaankari
   zyrox --self-test                          # install check (APK ki zaroorat nahi)
@@ -44,7 +50,7 @@ import time
 import zlib
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.2.0"
 REPO = "https://github.com/zyroxteam/zyrox-encryption"
 
 HERE = Path(__file__).resolve().parent
@@ -357,6 +363,29 @@ def roundtrip(s: str, seed: int, mult: int) -> str:
     return from_units(xcrypt_units(xcrypt_units(to_units(s), seed, mult), seed, mult))
 
 
+# ------------------------------------------------- per-string crypto (v1.2)
+def derive_mult(seed: int) -> int:
+    """Har string ka mult uske seed se deterministic — decryptor khud derive karega."""
+    return (seed * 0x25 + 0x1B) & 0xFFFF
+
+
+def enc_payload(units: list[int], seed: int, mask: int) -> list[int]:
+    """Payload = [seed ^ mask] + encrypted units. Har string ki apni seed."""
+    mult = derive_mult(seed)
+    enc = [(u ^ ks(i, seed, mult)) & 0xFFFF for i, u in enumerate(units)]
+    return [((seed ^ mask) & 0xFFFF)] + enc
+
+
+def dec_payload(payload: list[int], mask: int) -> list[int]:
+    seed = (payload[0] ^ mask) & 0xFFFF
+    mult = derive_mult(seed)
+    return [(u ^ ks(i, seed, mult)) & 0xFFFF for i, u in enumerate(payload[1:])]
+
+
+def roundtrip2(s: str, seed: int, mask: int) -> str:
+    return from_units(dec_payload(enc_payload(to_units(s), seed, mask), mask))
+
+
 def unescape(s: str) -> str:
     out, i, n = [], 0, len(s)
     while i < n:
@@ -397,8 +426,8 @@ def units_escape(units: list[int]) -> str:
     return "".join(out)
 
 
-def transform(text: str, seed: int, mult: int, cls: str, meth: str,
-              stats: dict, strip: bool) -> str:
+def transform(text: str, keys: dict, stats: dict, strip: bool,
+              min_len: int, rnd: random.Random) -> str:
     out = []
     for line in text.split("\n"):
         cr = "\r" if line.endswith("\r") else ""
@@ -409,12 +438,21 @@ def transform(text: str, seed: int, mult: int, cls: str, meth: str,
         if m:
             ind, jumbo, reg, lit, tail = m.groups()
             jumbo = jumbo or ""
-            enc = xcrypt_units(to_units(unescape(lit)), seed, mult)
+            plain = unescape(lit)
+            if len(plain) < min_len:
+                out.append(L + cr)   # chhoti/khaali string — encrypt nahi
+                continue
+            units = to_units(plain)
+            if keys["simple"]:
+                enc = xcrypt_units(units, keys["seed"], keys["mult"])
+            else:
+                seed = rnd.randint(0x1, 0xFFFE)   # har string ki apni seed
+                enc = enc_payload(units, seed, keys["mask"])
             stats["strings"] += 1
             stats["units"] += len(enc)
             out.append(f'{ind}const-string{jumbo} {reg}, "{units_escape(enc)}"{tail}')
-            out.append(f"{ind}invoke-static {{{reg}}}, {cls}->"
-                       f"{meth}(Ljava/lang/String;)Ljava/lang/String;")
+            out.append(f"{ind}invoke-static {{{reg}}}, {keys['desc']}->"
+                       f"{keys['meth']}(Ljava/lang/String;)Ljava/lang/String;")
             out.append(f"{ind}move-result-object {reg}")
         else:
             out.append(L + cr)
@@ -422,19 +460,24 @@ def transform(text: str, seed: int, mult: int, cls: str, meth: str,
 
 
 def gen_keys(rnd: random.Random, simple: bool) -> dict:
-    seed = rnd.randint(0x101, 0x7FFE)
-    mult = rnd.randint(0x81, 0x7FFF)
     pkg = "".join(rnd.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(rnd.randint(4, 7)))
     cls = "".join(rnd.choice("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
                   for _ in range(rnd.randint(5, 8)))
     meth = "a" + "".join(rnd.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(rnd.randint(4, 8)))
-    mb = rnd.randint(0x1000, 0x3FFF)
-    sb = rnd.randint(0x1000, 0x3FFF)
-    return {"seed": seed, "mult": mult,
-            "ma": mult ^ mb, "mb": mb,      # ma ^ mb == mult
-            "sa": seed ^ sb, "sb": sb,      # sa ^ sb == seed
-            "pkg": pkg, "cls": cls, "meth": meth,
-            "desc": f"L{pkg}/{cls};", "simple": simple}
+    keys: dict = {"pkg": pkg, "cls": cls, "meth": meth,
+                  "desc": f"L{pkg}/{cls};", "simple": simple}
+    if simple:
+        # debug mode: ek global seed/mult, seedhe smali me (aasan debugging)
+        keys["seed"] = rnd.randint(0x101, 0x7FFE)
+        keys["mult"] = rnd.randint(0x81, 0x7FFF)
+    else:
+        # production: har string ki apni seed; sirf global mask hidden (XOR-split)
+        mask = rnd.randint(0x101, 0xFFFE)
+        mb = rnd.randint(0x1000, 0x3FFF)
+        keys["mask"] = mask
+        keys["ma"] = mask ^ mb
+        keys["mb"] = mb                    # ma ^ mb == mask
+    return keys
 
 
 def decryptor_smali(desc: str, meth: str, keys: dict) -> str:
@@ -484,24 +527,40 @@ def decryptor_smali(desc: str, meth: str, keys: dict) -> str:
     return-object v3
 .end method
 """
+    # per-string mode: payload = [seed ^ mask] + encrypted units
+    # seed = charAt(0) ^ mask; mult = seed * 0x25 + 0x1b (derive_mult jaisa)
     return f""".class public final {desc}
 .super Ljava/lang/Object;
 
 
 .method public static {meth}(Ljava/lang/String;)Ljava/lang/String;
-    .locals 7
+    .locals 8
 
     const v5, 0x{keys["ma"]:04x}
 
     xor-int/lit16 v5, v5, 0x{keys["mb"]:04x}
 
-    const v6, 0x{keys["sa"]:04x}
+    const/4 v2, 0x0
 
-    xor-int/lit16 v6, v6, 0x{keys["sb"]:04x}
+    invoke-virtual {{p0, v2}}, Ljava/lang/String;->charAt(I)C
+
+    move-result v3
+
+    xor-int/2addr v3, v5
+
+    int-to-char v3, v3
+
+    move v5, v3
+
+    mul-int/lit16 v6, v5, 0x0025
+
+    add-int/lit16 v6, v6, 0x001b
 
     invoke-virtual {{p0}}, Ljava/lang/String;->length()I
 
     move-result v0
+
+    add-int/lit8 v0, v0, -0x1
 
     new-array v1, v0, [C
 
@@ -510,13 +569,15 @@ def decryptor_smali(desc: str, meth: str, keys: dict) -> str:
     :cond_0
     if-ge v2, v0, :cond_1
 
-    invoke-virtual {{p0, v2}}, Ljava/lang/String;->charAt(I)C
+    add-int/lit8 v7, v2, 0x1
+
+    invoke-virtual {{p0, v7}}, Ljava/lang/String;->charAt(I)C
 
     move-result v3
 
-    mul-int v4, v2, v5
+    mul-int v4, v2, v6
 
-    add-int v4, v4, v6
+    add-int v4, v4, v5
 
     xor-int/2addr v3, v4
 
@@ -536,6 +597,178 @@ def decryptor_smali(desc: str, meth: str, keys: dict) -> str:
     return-object v3
 .end method
 """
+
+# ============================================================ runtime guards
+APP_NAME_RE = re.compile(r'<application\b[^>]*?android:name="([^"]+)"', re.S)
+PKG_RE = re.compile(r'<manifest\b[^>]*?package="([^"]+)"', re.S)
+ONCREATE_RE = re.compile(r'^(\.method[^\n]*\bonCreate\(\)V[^\n]*\n)', re.M)
+LOCALS_RE = re.compile(r'^[ \t]*\.(locals|registers)[^\n]*\n', re.M)
+
+
+def guard_smali(pkg: str, cls: str, meth: str, anti_debug: bool, anti_root: bool) -> str:
+    """Application.onCreate se call hone wala guard — debugger/root pe exit(-1).
+    Poora check try/catch me hai taaki guard kabhi legit user ko crash na kare."""
+    desc = f"L{pkg}/{cls};"
+    checks = []
+    if anti_debug:
+        checks.append("""    invoke-static {}, Landroid/os/Debug;->isDebuggerConnected()Z
+
+    move-result v0
+
+    if-eqz v0, :cond_bad""")
+    if anti_root:
+        checks.append("""    new-instance v0, Ljava/io/File;
+
+    const-string v1, "/system/xbin/su"
+
+    invoke-direct {v0, v1}, Ljava/io/File;-><init>(Ljava/lang/String;)V
+
+    invoke-virtual {v0}, Ljava/io/File;->exists()Z
+
+    move-result v0
+
+    if-nez v0, :cond_bad
+
+    new-instance v0, Ljava/io/File;
+
+    const-string v1, "/system/bin/su"
+
+    invoke-direct {v0, v1}, Ljava/io/File;-><init>(Ljava/lang/String;)V
+
+    invoke-virtual {v0}, Ljava/io/File;->exists()Z
+
+    move-result v0
+
+    if-nez v0, :cond_bad
+
+    sget-object v0, Landroid/os/Build;->TAGS:Ljava/lang/String;
+
+    if-eqz v0, :cond_ok
+
+    const-string v1, "test-keys"
+
+    invoke-virtual {v0, v1}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z
+
+    move-result v0
+
+    if-eqz v0, :cond_bad
+
+    :cond_ok""")
+    body = "\n\n".join(checks)
+    return f""".class public final {desc}
+.super Ljava/lang/Object;
+
+
+.method public static {meth}(Landroid/content/Context;)V
+    .locals 3
+
+    :try_start_0
+{body}
+
+    :try_end_0
+    .catch Ljava/lang/Exception; {{:try_start_0 .. :try_end_0}} :catch_0
+
+    return-void
+
+    :cond_bad
+    invoke-static {{}}, Ljava/lang/Runtime;->getRuntime()Ljava/lang/Runtime;
+
+    move-result-object v0
+
+    const/4 v1, -0x1
+
+    invoke-virtual {{v0, v1}}, Ljava/lang/Runtime;->exit(I)V
+
+    return-void
+
+    :catch_0
+    return-void
+.end method
+"""
+
+
+def _find_smali(smali_dirs: list[Path], dotted: str) -> Path | None:
+    rel = dotted.replace(".", "/") + ".smali"
+    for sd in smali_dirs:
+        c = sd / rel
+        if c.exists():
+            return c
+    return None
+
+
+def inject_guard_call(dec: Path, smali_dirs: list[Path], guard_desc: str,
+                      guard_meth: str, rnd: random.Random) -> str:
+    """Guard call Application.onCreate me inject karo. Returns info string."""
+    mf = dec / "AndroidManifest.xml"
+    txt = mf.read_text(errors="ignore")
+    dotted = None
+    m = APP_NAME_RE.search(txt)
+    if m:
+        name = m.group(1)
+        if name.startswith("."):
+            pm = PKG_RE.search(txt)
+            name = (pm.group(1) if pm else "") + name
+        dotted = name
+    target = _find_smali(smali_dirs, dotted) if dotted else None
+    call = f"    invoke-static {{p0}}, {guard_desc}->{guard_meth}(Landroid/content/Context;)V"
+    if target is None:
+        # app ka apna Application nahi — naya subclass banao + manifest me lagao
+        pkg = "".join(rnd.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(rnd.randint(4, 7)))
+        cls = "Z" + "".join(rnd.choice("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+                            for _ in range(rnd.randint(5, 8)))
+        desc = f"L{pkg}/{cls};"
+        dotted_new = f"{pkg}.{cls}"
+        smali = ("".join([
+            f".class public {desc}\n",
+            ".super Landroid/app/Application;\n",
+            "\n\n",
+            ".method public onCreate()V\n",
+            "    .locals 1\n",
+            "\n",
+            "    invoke-super {p0}, Landroid/app/Application;->onCreate()V\n",
+            "\n",
+            f"    {call}\n",
+            "\n",
+            "    return-void\n",
+            ".end method\n",
+        ]))
+        d = smali_dirs[0] / pkg
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{cls}.smali").write_text(smali)
+        new_txt, n = re.subn(r'<application\b', f'<application android:name="{dotted_new}"',
+                             txt, count=1)
+        if n:
+            mf.write_text(new_txt)
+            return f"naya Application banaya: {dotted_new}"
+        return "manifest edit fail (application tag nahi mila)"
+    stxt = target.read_text(errors="surrogateescape")
+    m2 = ONCREATE_RE.search(stxt)
+    if m2:
+        rest = stxt[m2.end():]
+        m3 = LOCALS_RE.search(rest)
+        if m3:
+            pos = m2.end() + m3.end()
+            stxt = stxt[:pos] + "\n" + call + "\n" + stxt[pos:]
+        else:
+            stxt = stxt[:m2.end()] + "    " + call + "\n" + stxt[m2.end():]
+    else:
+        new_m = ("\n.method public onCreate()V\n    .locals 1\n\n"
+                 "    invoke-super {p0}, Landroid/app/Application;->onCreate()V\n\n"
+                 f"    {call}\n\n    return-void\n.end method\n")
+        stxt = stxt.rstrip("\n") + "\n" + new_m
+    target.write_text(stxt, errors="surrogateescape")
+    return f"inject hua: {dotted}"
+
+
+def harden_manifest(dec: Path) -> bool:
+    """android:debuggable=true mile to false karo. Returns True agar badla."""
+    mf = dec / "AndroidManifest.xml"
+    txt = mf.read_text(errors="ignore")
+    new_txt, n = re.subn(r'android:debuggable="true"', 'android:debuggable="false"', txt)
+    if n:
+        mf.write_text(new_txt)
+        return True
+    return False
 
 
 # ==================================================================== apktool
@@ -627,6 +860,31 @@ def run_self_test(skip_tools_on_missing: bool = True) -> int:
         log(f"    ❌ {bad}/{n} FAIL")
         fails += 1
 
+    # 2b --------- per-string crypto (v1.2)
+    log("\n[2b/3] per-string crypto (har string ki apni seed)…")
+    rnd2 = random.Random(os.urandom(8))
+    n2 = bad2 = 0
+    for t in tests:
+        mask = rnd2.randint(0x101, 0xFFFE)
+        seed = rnd2.randint(0x1, 0xFFFE)
+        n2 += 1
+        if not t or roundtrip2(t, seed, mask) != t:
+            if t:
+                bad2 += 1
+                log(f"    ❌ FAIL seed=0x{seed:04x} mask=0x{mask:04x} text={t[:30]!r}")
+    # alag-alag seeds = alag-alag ciphertext (same plaintext)
+    c1 = enc_payload(to_units("same secret"), 0x1234, 0xABCD)
+    c2 = enc_payload(to_units("same secret"), 0x5678, 0xABCD)
+    if c1 == c2:
+        bad2 += 1
+        log("    ❌ FAIL: same plaintext, different seeds — ciphertext same!")
+    n2 += 1
+    if bad2 == 0:
+        log(f"    ✅ {n2}/{n2} PASS  (per-string seeds unique ciphertext dete hain)")
+    else:
+        log(f"    ❌ {bad2}/{n2} FAIL")
+        fails += 1
+
     # 3 ---------- zip writer
     log("\n[3/3] zip writer + alignment…")
     import tempfile as _tf
@@ -658,8 +916,19 @@ def run_self_test(skip_tools_on_missing: bool = True) -> int:
     return 0 if fails == 0 else 2
 
 # ======================================================================= main
+class ZyroxParser(argparse.ArgumentParser):
+    def error(self, message):
+        if "unrecognized arguments" in message:
+            log(f"\n❌ {message}")
+            log('\n💡 Hint: agar APK ke path me SPACE hai to quotes lagao:')
+            log('   zyrox "/storage/emulated/0/Protect Apk/myapp.apk"')
+            log("   (bina quotes ke shell path ko tod deta hai — 'Protect' aur 'Apk/' alag ho jaate hain)")
+            sys.exit(2)
+        super().error(message)
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser(
+    ap = ZyroxParser(
         prog="zyrox",
         description="ZYROX ENCRYPTION — APK string-encryption + debug-strip + signing CLI",
         epilog="Example:  zyrox /sdcard/myapp.apk --keys my-release.jks")
@@ -669,6 +938,14 @@ def main() -> None:
     ap.add_argument("--keep-debug", action="store_true", help="debug info mat hatao")
     ap.add_argument("--simple-keys", action="store_true", help="keys direct (debug ke liye)")
     ap.add_argument("--no-sign", action="store_true", help="sign mat karo")
+    ap.add_argument("--min-len", type=int, default=1,
+                    help="is se chhoti strings encrypt nahi hongi (default 1 = sab, khaali chhod ke)")
+    ap.add_argument("--anti-debug", action="store_true",
+                    help="debugger attach ho to app turant band (Application.onCreate me guard)")
+    ap.add_argument("--anti-root", action="store_true",
+                    help="rooted device pe app turant band (su binary + test-keys check)")
+    ap.add_argument("--harden-manifest", action="store_true",
+                    help="android:debuggable=true mile to false kar do")
     ap.add_argument("--ks-file", "--keys", dest="ks_file", default=None,
                     help="apni keystore (.jks/.ks/.keystore) — purani app ke update ke liye")
     ap.add_argument("--ks-pass", default=None, help="keystore password")
@@ -696,6 +973,16 @@ def main() -> None:
         die("apktool.jar nahi mila — chalayein:  bash setup.sh")
 
     apk = Path(os.path.expanduser(args.apk)).resolve()
+    if apk.is_dir():
+        found = sorted(apk.glob("*.apk")) or sorted(apk.rglob("*.apk"))
+        if len(found) == 1:
+            log(f"[i] folder diya tha — APK mil gaya: {found[0].name}")
+            apk = found[0]
+        elif not found:
+            die(f"Folder me koi .apk nahi mila: {apk}")
+        else:
+            die("Folder me kai APK mile — kaunsi wali?\n" +
+                "\n".join(f"   - {f.name}" for f in found[:10]))
     if not apk.exists():
         die(f"APK nahi mila: {apk}")
     if apk.suffix.lower() not in (".apk",):
@@ -753,19 +1040,20 @@ def main() -> None:
         log(f"    smali: {', '.join(d.name for d in smali_dirs)}   minSdk={min_sdk}")
 
         # 2 ---------------------------------------------------- encrypt + strip
+        rnd = random.Random(os.urandom(16))
         keys = None
+        crypto_mode = "off"
         if args.no_strings:
             log(f"\n[2/{total}] string encryption SKIP")
         else:
             log(f"\n[2/{total}] strings encrypt + debug strip…")
-            rnd = random.Random(os.urandom(16))
             keys = gen_keys(rnd, args.simple_keys)
+            crypto_mode = "simple (direct keys)" if args.simple_keys else "per-string keys"
             strip = not args.keep_debug
             for sd in smali_dirs:
                 for f in sd.rglob("*.smali"):
                     txt = f.read_text(errors="surrogateescape")
-                    new = transform(txt, keys["seed"], keys["mult"], keys["desc"],
-                                    keys["meth"], stats, strip)
+                    new = transform(txt, keys, stats, strip, max(1, args.min_len), rnd)
                     if new != txt:
                         f.write_text(new, errors="surrogateescape")
                     stats["classes"] += 1
@@ -774,16 +1062,45 @@ def main() -> None:
             (ddir / f"{keys['cls']}.smali").write_text(
                 decryptor_smali(keys["desc"], keys["meth"], keys))
             log(f"    ✅ {stats['strings']} strings encrypt ({stats['units']} UTF-16 units), "
-                f"{stats['classes']} classes")
-            log(f"    decryptor: {keys['desc']}->{keys['meth']}()   "
-                f"[{'direct keys' if args.simple_keys else 'hidden keys (XOR-split)'}]")
-            tests = ["a", "", "Hello secret world", "sk_live_9f8a", "https://x.io/a?b=1&c=%20#d",
+                f"{stats['classes']} classes   [min-len={max(1, args.min_len)}]")
+            log(f"    decryptor: {keys['desc']}->{keys['meth']}()   [{crypto_mode}]")
+            tests = ["a", "Hello secret world", "sk_live_9f8a", "https://x.io/a?b=1&c=%20#d",
                      "हिन्दी टेस्ट", "中文 العربية", "🙏🕉️ emoji", 'line\nbreak\ttab"q\\s',
                      "\x00null\x1f", "a" * 400]
-            bad = [t for t in tests if roundtrip(t, keys["seed"], keys["mult"]) != t]
+            if args.simple_keys:
+                bad = [t for t in tests if roundtrip(t, keys["seed"], keys["mult"]) != t]
+            else:
+                bad = [t for t in tests
+                       if roundtrip2(t, rnd.randint(0x1, 0xFFFE), keys["mask"]) != t]
             if bad:
                 die(f"crypto self-test FAIL: {bad[:2]!r}")
-            log("    self-test: 11/11 PASS ✅")
+            log("    self-test: 10/10 PASS ✅")
+
+        # 2b --------------------------------------------------- guards
+        guard_info = None
+        if args.anti_debug or args.anti_root:
+            log(f"\n[2b/{total}] runtime guard inject (anti-debug/root)…")
+            gpkg = "".join(rnd.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(rnd.randint(4, 7)))
+            gcls = "".join(rnd.choice("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+                           for _ in range(rnd.randint(5, 8)))
+            gmeth = "g" + "".join(rnd.choice("abcdefghijklmnopqrstuvwxyz")
+                                  for _ in range(rnd.randint(4, 8)))
+            gdir = dec / "smali" / gpkg
+            gdir.mkdir(parents=True, exist_ok=True)
+            (gdir / f"{gcls}.smali").write_text(
+                guard_smali(gpkg, gcls, gmeth, args.anti_debug, args.anti_root))
+            guard_info = inject_guard_call(dec, smali_dirs, f"L{gpkg}/{gcls};", gmeth, rnd)
+            log(f"    ✅ guard {guard_info}")
+            log(f"       (debug={'ON' if args.anti_debug else 'off'}, "
+                f"root={'ON' if args.anti_root else 'off'})")
+
+        # 2c --------------------------------------------------- manifest harden
+        hardened = False
+        if args.harden_manifest:
+            log(f"\n[2c/{total}] manifest harden…")
+            hardened = harden_manifest(dec)
+            log("    ✅ android:debuggable=false" if hardened
+                else "    [i] debuggable pehle se off tha")
 
         # 3 ---------------------------------------------------- rebuild
         log(f"\n[3/{total}] apktool se rebuild (naya dex)…")
@@ -904,7 +1221,10 @@ def main() -> None:
             "strings_encrypted": stats["strings"], "utf16_units": stats["units"],
             "classes_processed": stats["classes"],
             "debug_stripped": (not args.keep_debug) and (not args.no_strings),
-            "keys_hidden": (not args.simple_keys) and keys is not None,
+            "crypto_mode": crypto_mode,
+            "min_len": max(1, args.min_len),
+            "guard": guard_info,
+            "manifest_hardened": hardened,
             "min_sdk": min_sdk, "signed": not args.no_sign,
             "seconds": round(time.time() - t0, 1),
         }

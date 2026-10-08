@@ -24,8 +24,9 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from zyrox import (  # noqa: E402
-    CONST_RE, DEX_RE, Signer, apktool_decode, find_tool, human, java_bin,
-    sanity_check_zip, to_units, unescape, xcrypt_units,
+    CONST_RE, DEX_RE, Signer, apktool_decode, dec_payload, derive_mult,
+    find_tool, human, java_bin, sanity_check_zip, to_units, unescape,
+    xcrypt_units,
 )
 
 OK, BAD = "✅", "❌"
@@ -37,11 +38,24 @@ REG_MUL_RE = re.compile(r"mul-int v\d+, v\d+, v(\d+)")
 REG_ADD_RE = re.compile(r"add-int v\d+, v\d+, v(\d+)")
 
 
-def extract_keys(smali_text: str) -> tuple[int, int, str] | None:
-    """Decryptor ke seed/mult nikalo — simple ya hidden (XOR-split) dono se."""
+V2_MUL_RE = re.compile(r"mul-int/lit16 v(\d+), v(\d+), 0x0025")
+V2_ADD_RE = re.compile(r"add-int/lit16 v\d+, v\d+, 0x001b")
+
+
+def extract_keys(smali_text: str):
+    """Decryptor ke keys nikalo.
+    v1.2 per-string mode  -> (mask, "per-string (hidden mask)")
+    purana hidden (XOR-split) -> (seed, mult, "hidden (XOR-split)")
+    simple/direct           -> (seed, mult, "direct")
+    """
     reg: dict[str, int] = {}
     for m in PAIR_RE.finditer(smali_text):
         reg[m.group(1)] = int(m.group(2), 16) ^ int(m.group(3), 16)
+    # v1.2: mask XOR-split + mult = seed * 0x25 + 0x1b
+    vm = V2_MUL_RE.search(smali_text)
+    va = V2_ADD_RE.search(smali_text)
+    if vm and va and vm.group(2) in reg:
+        return reg[vm.group(2)], "per-string (hidden mask)"
     mm, am = REG_MUL_RE.search(smali_text), REG_ADD_RE.search(smali_text)
     if mm and am and mm.group(1) in reg and am.group(1) in reg:
         return reg[am.group(1)], reg[mm.group(1)], "hidden (XOR-split)"
@@ -118,9 +132,16 @@ def main() -> None:
         if not found:
             print(f"    {BAD} decryptor class nahi mili — protection laga hua nahi lagta")
         else:
-            f, (seed, mult, mode) = found
+            f, keys = found
             print(f"    decryptor : {f.relative_to(tdp / 'p')}")
-            print(f"    key mode  : {mode}   seed=0x{seed:04x}  mult=0x{mult:04x}")
+            if len(keys) == 2:
+                mask, mode = keys
+                per_string = True
+                print(f"    key mode  : {mode}   mask=0x{mask:04x}")
+            else:
+                seed, mult, mode = keys
+                per_string = False
+                print(f"    key mode  : {mode}   seed=0x{seed:04x}  mult=0x{mult:04x}")
             try:
                 apktool_decode(java, apktool, orig, tdp / "o")
                 base = tdp / "o" / "smali"
@@ -142,7 +163,12 @@ def main() -> None:
                             continue
                         for x, y in zip(a, b):
                             checked += 1
-                            if to_units(x) == xcrypt_units(to_units(y), seed, mult):
+                            yu = to_units(y)
+                            if per_string:
+                                ok = (to_units(x) == dec_payload(yu, mask)) or (x == y)
+                            else:
+                                ok = to_units(x) == xcrypt_units(yu, seed, mult)
+                            if ok:
                                 match += 1
                             else:
                                 mismatch += 1
